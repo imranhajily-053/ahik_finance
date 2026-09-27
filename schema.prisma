@@ -1,0 +1,236 @@
+// ============================================================================
+// AHİK Maliyyə İnformasiya Sistemi — Prisma Schema
+// Single source of truth: bütün hesabatlar income_transactions cədvəlinin
+// üzərində aggregation kimi qurulur. Bu fayl ayrıca "hesabat cədvəlləri"
+// saxlamır — məhz bu qəsdən belədir (bax bənd 54).
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------------------------------------------------------------
+// AUTH / RBAC
+// ----------------------------------------------------------------------------
+
+enum RoleName {
+  EXECUTIVE // İcraçı / Operator: CRUD + reports
+  READER // Yalnız oxuma: dashboard, hesabat, export
+  ADMIN // Gələcək: master data + user idarəsi (bənd 38)
+}
+
+model Role {
+  id          String       @id @default(cuid())
+  name        RoleName     @unique
+  description String?
+  permissions Permission[]
+  users       User[]
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  @@map("roles")
+}
+
+// Granular permission table — RoleName enum tək başına kifayət etsə də,
+// gələcəkdə yeni rolların yaradılmasına imkan vermək üçün permission-lar
+// ayrıca saxlanılır (bənd 2: "gələcəkdə əlavə rolların yaradılması").
+model Permission {
+  id    String @id @default(cuid())
+  key   String @unique // e.g. "transaction:create", "transaction:delete", "report:export"
+  roles Role[]
+
+  @@map("permissions")
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  fullName     String
+  passwordHash String
+  roleId       String
+  role         Role     @relation(fields: [roleId], references: [id])
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  createdTransactions IncomeTransaction[] @relation("CreatedByUser")
+  updatedTransactions IncomeTransaction[] @relation("UpdatedByUser")
+  auditLogs           AuditLog[]
+
+  @@map("users")
+}
+
+// ----------------------------------------------------------------------------
+// MASTER DATA: ORGANIZATIONS (self-referencing hierarchy)
+// ----------------------------------------------------------------------------
+
+enum OrganizationType {
+  MEMBER_UNION // Bənd 5-dəki 26 həmkarlar ittifaqı
+  PRESIDENT_ADMINISTRATION // Parent üçün özü
+  PRESIDENT_ADMINISTRATION_SUBORDINATE // Bənd 6-dakı 28 alt təşkilat
+  OTHER
+}
+
+model Organization {
+  id          String           @id @default(cuid())
+  name        String
+  shortName   String?
+  type        OrganizationType
+  parentId    String?
+  parent      Organization?    @relation("OrgHierarchy", fields: [parentId], references: [id])
+  children    Organization[]   @relation("OrgHierarchy")
+
+  // Ağıllı axtarış üçün: qısaltmalar, alternativ adlar (bənd 56, 7)
+  searchableAliases String[] @default([])
+
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  transactions IncomeTransaction[]
+
+  @@index([parentId])
+  @@index([type])
+  // Trigram/full-text index axtarış performansı üçün miqrasiyada əlavə edilir
+  // (bax: prisma/migrations/..._add_search_indexes/migration.sql)
+  @@map("organizations")
+}
+
+// ----------------------------------------------------------------------------
+// MASTER DATA: PURPOSES (daxilolma təyinatları) — hard-code edilməyib
+// ----------------------------------------------------------------------------
+
+model Purpose {
+  id     String  @id @default(cuid())
+  name   String  @unique
+  code   String  @unique // stabil proqram daxili açar, məs. "MEMBERSHIP_FEE"
+  active Boolean @default(true)
+
+  // Bənd 10: Overnight business rule. Yalnız bu purpose üçün source boş ola bilər.
+  allowsEmptySource Boolean @default(false)
+
+  // Bu purpose üzrə ayrıca hesabat səhifəsi varmı, hansı route-a bağlıdır (UI üçün)
+  reportSlug String? // "membership-fees" | "sanatorium" | "debt" | "cultural-events" | "overnight"
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  transactions IncomeTransaction[]
+
+  @@map("purposes")
+}
+
+// ----------------------------------------------------------------------------
+// CORE ENTITY: INCOME TRANSACTION — ONE SOURCE OF TRUTH
+// ----------------------------------------------------------------------------
+
+enum TransactionStatus {
+  ACTIVE
+  VOID // soft-delete əvəzinə status dəyişikliyi ilə audit trace saxlanılır
+}
+
+enum Currency {
+  AZN
+  USD
+  EUR
+  RUB
+  // Gələcəkdə asanlıqla əlavə oluna bilər
+}
+
+model IncomeTransaction {
+  id String @id @default(cuid())
+
+  transactionDate DateTime @db.Date
+
+  // Overnight sazişi istisna olmaqla mütləqdir (bənd 10) — DB səviyyəsində
+  // CHECK constraint ilə də qorunur (bax migration.sql).
+  sourceOrganizationId String?
+  sourceOrganization   Organization? @relation(fields: [sourceOrganizationId], references: [id])
+
+  purposeId String
+  purpose   Purpose @relation(fields: [purposeId], references: [id])
+
+  // amount NUMERIC(14,2) - float İSTİFADƏ OLUNMUR (bənd 3, 35)
+  amount   Decimal  @db.Decimal(14, 2)
+  currency Currency @default(AZN)
+
+  description String?
+
+  status TransactionStatus @default(ACTIVE)
+
+  createdById String
+  createdBy   User   @relation("CreatedByUser", fields: [createdById], references: [id])
+  updatedById String?
+  updatedBy   User?   @relation("UpdatedByUser", fields: [updatedById], references: [id])
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime? // soft delete (bənd 25)
+
+  // Duplicate-detection üçün texniki iz (bənd 37) — eyni məbləğ/tarix/mənbə/
+  // təyinatlı yazı daxil edilərkən UI xəbərdarlıq göstərir, lakin BLOK ETMİR,
+  // çünki iki qanuni fərqli ödəniş eyni görünə bilər.
+  duplicateOfId String?
+
+  isDemo Boolean @default(false) // bənd 46: demo seed data açıq şəkildə işarələnir
+
+  @@index([transactionDate])
+  @@index([purposeId, transactionDate])
+  @@index([sourceOrganizationId, transactionDate])
+  @@index([status])
+  @@map("income_transactions")
+}
+
+// ----------------------------------------------------------------------------
+// AUDIT LOG (bənd 25, 50) — adi istifadəçi tərəfindən dəyişdirilə bilməz;
+// yalnız append-only, heç bir update/delete API-si yoxdur.
+// ----------------------------------------------------------------------------
+
+enum AuditAction {
+  CREATE
+  UPDATE
+  DELETE
+}
+
+model AuditLog {
+  id         String      @id @default(cuid())
+  entity     String // e.g. "IncomeTransaction"
+  entityId   String
+  action     AuditAction
+  fieldName  String? // hansı sahə dəyişdi (UPDATE üçün)
+  oldValue   String? // JSON-string
+  newValue   String? // JSON-string
+  userId     String
+  user       User        @relation(fields: [userId], references: [id])
+  createdAt  DateTime    @default(now())
+
+  @@index([entity, entityId])
+  @@index([userId])
+  @@map("audit_logs")
+}
+
+// ----------------------------------------------------------------------------
+// DƏSTƏKLƏYİCİ ENTITY-LƏR
+// ----------------------------------------------------------------------------
+
+model SystemSetting {
+  key   String @id
+  value String
+
+  @@map("system_settings")
+}
+
+model SavedFilter {
+  id        String   @id @default(cuid())
+  userId    String
+  name      String
+  filters   Json
+  createdAt DateTime @default(now())
+
+  @@map("saved_filters")
+}

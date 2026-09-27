@@ -1,0 +1,36 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ahik_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me_in_production}
+      POSTGRES_DB: ahik_finance
+    ports:
+      - "5432:5432"
+    volumes:
+      - ahik_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ahik_user"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://ahik_user:${POSTGRES_PASSWORD:-change_me_in_production}@db:5432/ahik_finance?schema=public
+      AUTH_SECRET: ${AUTH_SECRET:?AUTH_SECRET mütləqdir - openssl rand -base64 32 ilə yaradın}
+      APP_URL: ${APP_URL:-http://localhost:3000}
+      NODE_ENV: production
+    ports:
+      - "3000:3000"
+
+volumes:
+  ahik_db_data:
